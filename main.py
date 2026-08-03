@@ -8,7 +8,6 @@ import imageio_ffmpeg
 
 app = FastAPI(title="Limitless Clipping Engine")
 
-# CORS setup
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -17,11 +16,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Output directory for processed video clips
 OUTPUT_DIR = "static_clips"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# Serve generated clips as public static files
 app.mount("/clips", StaticFiles(directory=OUTPUT_DIR), name="clips")
 
 class ClipRequest(BaseModel):
@@ -43,29 +40,30 @@ def generate_clips(data: ClipRequest):
         ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
         raw_video_path = os.path.join(OUTPUT_DIR, "source_video.mp4")
         
-        # 1. Download YouTube Video via yt-dlp
+        # Fast low-res download to prevent Render timeout & RAM crash
         yt_cmd = [
             "yt-dlp",
-            "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+            "-f", "b[ext=mp4]/w[ext=mp4]/best",
             "-o", raw_video_path,
             "--force-overwrites",
+            "--no-playlist",
             data.youtube_url
         ]
-        subprocess.run(yt_cmd, check=True)
+        
+        res = subprocess.run(yt_cmd, capture_output=True, text=True)
+        if res.returncode != 0:
+            raise Exception(f"yt-dlp download failed: {res.stderr[:150]}")
 
         generated_clips = []
         
-        # 2. Slice video into requested duration and ratio
-        for i in range(1, data.clip_count + 1):
+        # Render clips with ultrafast preset
+        count_to_process = min(data.clip_count, 3) # Max 3 clips for fast processing
+        for i in range(1, count_to_process + 1):
             start_time = (i - 1) * data.duration
-            output_filename = f"clip_{i}_{data.duration}s.mp4"
+            output_filename = f"clip_{i}.mp4"
             output_filepath = os.path.join(OUTPUT_DIR, output_filename)
             
-            # Aspect ratio crop filter
-            if data.aspect_ratio == "9:16":
-                vf_filter = "crop=ih*(9/16):ih"
-            else:
-                vf_filter = "scale=1920:1080"
+            vf_filter = "crop=ih*(9/16):ih" if data.aspect_ratio == "9:16" else "scale=1280:720"
                 
             ffmpeg_cmd = [
                 ffmpeg_exe, "-y",
@@ -74,12 +72,12 @@ def generate_clips(data: ClipRequest):
                 "-t", str(data.duration),
                 "-vf", vf_filter,
                 "-c:v", "libx264",
+                "-preset", "ultrafast",
                 "-c:a", "aac",
                 output_filepath
             ]
             subprocess.run(ffmpeg_cmd, check=True)
 
-            # Construct public download link
             clip_url = f"https://limitless-clipping-api.onrender.com/clips/{output_filename}"
             
             generated_clips.append({
@@ -97,4 +95,5 @@ def generate_clips(data: ClipRequest):
         }
 
     except Exception as e:
+        print("Error details:", str(e))
         raise HTTPException(status_code=500, detail=str(e))
