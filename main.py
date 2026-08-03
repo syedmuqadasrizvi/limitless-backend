@@ -1,4 +1,4 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -6,7 +6,7 @@ import os
 import subprocess
 import imageio_ffmpeg
 import json
-import urllib.request
+import uuid
 
 app = FastAPI(title="Limitless Clipping Engine")
 
@@ -39,18 +39,18 @@ class InfoRequest(BaseModel):
 def home():
     return {"status": "running", "message": "Limitless Clipping Engine is Active"}
 
-# Dynamic Video Info Fetcher
+# Fetch Dynamic Title, Thumbnail, and Duration
 @app.post("/api/fetch-info")
 def fetch_info(data: InfoRequest):
     try:
-        yt_cmd = [
+        cmd = [
             "yt-dlp",
             "--dump-json",
             "--no-playlist",
             "--extractor-args", "youtube:player_client=android,ios",
             data.youtube_url
         ]
-        res = subprocess.run(yt_cmd, capture_output=True, text=True)
+        res = subprocess.run(cmd, capture_output=True, text=True)
         if res.returncode == 0:
             info = json.loads(res.stdout)
             dur_sec = info.get("duration", 0)
@@ -64,77 +64,67 @@ def fetch_info(data: InfoRequest):
                 "uploader": info.get("uploader", "YouTube Channel"),
                 "duration": dur_str
             }
-    except Exception:
-        pass
+    except Exception as e:
+        print("Fetch info error:", str(e))
         
-    try:
-        oembed_url = f"https://www.youtube.com/oembed?url={data.youtube_url}&format=json"
-        req = urllib.request.Request(oembed_url, headers={'User-Agent': 'Mozilla/5.0'})
-        with urllib.request.urlopen(req) as response:
-            oembed_data = json.loads(response.read().decode())
-            return {
-                "success": True,
-                "title": oembed_data.get("title", "YouTube Video"),
-                "thumbnail": oembed_data.get("thumbnail_url", ""),
-                "uploader": oembed_data.get("author_name", "YouTube Channel"),
-                "duration": "Original length"
-            }
-    except Exception:
-        return {
-            "success": False,
-            "title": "YouTube Video",
-            "thumbnail": "",
-            "uploader": "YouTube Channel",
-            "duration": "N/A"
-        }
+    return {
+        "success": False,
+        "title": "YouTube Video",
+        "thumbnail": "",
+        "uploader": "YouTube Channel",
+        "duration": "N/A"
+    }
 
+# Render Clips directly from Direct Stream (No Bunny Fallback)
 @app.post("/api/generate-clips")
 def generate_clips(data: ClipRequest):
     try:
         ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
-        generated_clips = []
-        count_to_process = min(data.clip_count, 3)
         
-        for i in range(1, count_to_process + 1):
+        # 1. Get direct stream URL using yt-dlp
+        stream_cmd = [
+            "yt-dlp",
+            "-g",
+            "-f", "b[ext=mp4]/w[ext=mp4]/best",
+            "--extractor-args", "youtube:player_client=android,ios",
+            data.youtube_url
+        ]
+        res = subprocess.run(stream_cmd, capture_output=True, text=True)
+        
+        if res.returncode != 0 or not res.stdout.strip():
+            raise Exception("Could not fetch YouTube stream URL. Check link.")
+            
+        stream_url = res.stdout.strip().split("\n")[0]
+        generated_clips = []
+        
+        # Respect user's EXACT clip_count
+        for i in range(1, data.clip_count + 1):
             start_sec = (i - 1) * (data.duration + 5)
-            end_sec = start_sec + data.duration
-            
-            start_str = f"{start_sec // 3600:02d}:{(start_sec % 3600) // 60:02d}:{start_sec % 60:02d}"
-            end_str = f"{end_sec // 3600:02d}:{(end_sec % 3600) // 60:02d}:{end_sec % 60:02d}"
-            
-            raw_clip_path = os.path.join(OUTPUT_DIR, f"raw_{i}.mp4")
-            output_filename = f"clip_{i}.mp4"
+            unique_id = uuid.uuid4().hex[:6]
+            output_filename = f"clip_{i}_{unique_id}.mp4"
             output_filepath = os.path.join(OUTPUT_DIR, output_filename)
             
-            yt_cmd = [
-                "yt-dlp",
-                "--download-sections", f"*{start_str}-{end_str}",
-                "--extractor-args", "youtube:player_client=android,ios",
-                "-f", "b[ext=mp4]/w[ext=mp4]/best",
-                "-o", raw_clip_path,
-                "--force-overwrites",
-                "--no-playlist",
-                data.youtube_url
+            vf_filter = "crop=ih*(9/16):ih" if data.aspect_ratio == "9:16" else "scale=1280:720"
+            
+            # 2. FFmpeg directly cuts from stream without local file download block
+            ffmpeg_cmd = [
+                ffmpeg_exe, "-y",
+                "-ss", str(start_sec),
+                "-i", stream_url,
+                "-t", str(data.duration),
+                "-vf", vf_filter,
+                "-c:v", "libx264",
+                "-preset", "ultrafast",
+                "-c:a", "aac",
+                output_filepath
             ]
             
-            res = subprocess.run(yt_cmd, capture_output=True, text=True)
+            ff_res = subprocess.run(ffmpeg_cmd, capture_output=True, text=True)
             
-            if res.returncode == 0 and os.path.exists(raw_clip_path):
-                vf_filter = "crop=ih*(9/16):ih" if data.aspect_ratio == "9:16" else "scale=1280:720"
-                
-                ffmpeg_cmd = [
-                    ffmpeg_exe, "-y",
-                    "-i", raw_clip_path,
-                    "-vf", vf_filter,
-                    "-c:v", "libx264",
-                    "-preset", "ultrafast",
-                    "-c:a", "aac",
-                    output_filepath
-                ]
-                subprocess.run(ffmpeg_cmd, check=True)
+            if ff_res.returncode == 0 and os.path.exists(output_filepath):
                 clip_url = f"https://limitless-clipping-api.onrender.com/clips/{output_filename}"
             else:
-                clip_url = "https://www.w3schools.com/html/mov_bbb.mp4"
+                raise Exception(f"FFmpeg rendering failed for clip {i}")
 
             generated_clips.append({
                 "id": i,
@@ -151,16 +141,5 @@ def generate_clips(data: ClipRequest):
         }
 
     except Exception as e:
-        print("Backend exception handled:", str(e))
-        return {
-            "success": True,
-            "clips": [
-                {
-                    "id": 1,
-                    "title": "Limitless Clip #1",
-                    "duration": f"{data.duration}s",
-                    "ratio": data.aspect_ratio,
-                    "download_url": "https://www.w3schools.com/html/mov_bbb.mp4"
-                }
-            ]
-        }
+        print("Backend error:", str(e))
+        raise HTTPException(status_code=500, detail=str(e))
