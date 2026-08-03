@@ -40,9 +40,10 @@ def generate_clips(data: ClipRequest):
         ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
         raw_video_path = os.path.join(OUTPUT_DIR, "source_video.mp4")
         
-        # Fast low-res download to prevent Render timeout & RAM crash
+        # Extractor args to bypass YouTube bot block on Render IPs
         yt_cmd = [
             "yt-dlp",
+            "--extractor-args", "youtube:player_client=android,ios",
             "-f", "b[ext=mp4]/w[ext=mp4]/best",
             "-o", raw_video_path,
             "--force-overwrites",
@@ -52,12 +53,11 @@ def generate_clips(data: ClipRequest):
         
         res = subprocess.run(yt_cmd, capture_output=True, text=True)
         if res.returncode != 0:
-            raise Exception(f"yt-dlp download failed: {res.stderr[:150]}")
+            raise Exception(f"yt-dlp download failed: {res.stderr[:200]}")
 
         generated_clips = []
         
-        # Render clips with ultrafast preset
-        count_to_process = min(data.clip_count, 3) # Max 3 clips for fast processing
+        count_to_process = min(data.clip_count, 3)
         for i in range(1, count_to_process + 1):
             start_time = (i - 1) * data.duration
             output_filename = f"clip_{i}.mp4"
